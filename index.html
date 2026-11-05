@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Щелчок</title>
+<meta name="description" content="Щёлкни пальцами — и исчезни из кадра.">
+<meta name="theme-color" content="#0b0b0d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Щелчок">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>
+:root {
+--bg: #0b0b0d;
+--panel: rgba(18, 18, 22, 0.78);
+--line: rgba(255, 255, 255, 0.12);
+--text: #f2efe9;
+--muted: #a39d93;
+--accent: #ff8a3d;
+--accent2: #ffb36b;
+--ok: #7ee08a;
+--bad: #ff6b6b;
+--r: 16px;
+--safe-b: env(safe-area-inset-bottom, 0px);
+--safe-t: env(safe-area-inset-top, 0px);
+}
+[hidden] { display: none !important; }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+overflow: hidden; overscroll-behavior: none; -webkit-user-select: none; user-select: none; }
+button, input { font: inherit; color: inherit; }
+#stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: #000; touch-action: manipulation; }
+#view { max-width: 100%; max-height: 100%; width: auto; height: auto; display: block; background: #000; }
+#video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+#start { position: fixed; inset: 0; z-index: 30; display: flex; align-items: center; justify-content: center; padding: 24px;
+background: radial-gradient(1200px 700px at 50% 30%, #2a1a10 0%, #0b0b0d 60%); }
+#start .card { max-width: 520px; text-align: center; }
+#start h1 { font-size: clamp(44px, 10vw, 76px); margin: 0 0 6px; letter-spacing: -0.02em; font-weight: 800;
+background: linear-gradient(180deg, #fff 0%, #ffcf9e 55%, #ff8a3d 100%); -webkit-background-clip: text; background-clip: text; color: transparent; }
+#start p { color: var(--muted); margin: 0 auto 26px; max-width: 420px; font-size: 17px; }
+#dust { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.big { display: inline-flex; align-items: center; justify-content: center; gap: 10px; min-width: 220px; padding: 18px 34px; border: 0; border-radius: 999px;
+background: linear-gradient(180deg, var(--accent2), var(--accent)); color: #1b0f05; font-weight: 800; font-size: 21px; cursor: pointer;
+box-shadow: 0 10px 40px rgba(255, 138, 61, 0.35); transition: transform .12s ease, box-shadow .2s; }
+.big:active { transform: scale(0.97); }
+.big[disabled] { opacity: .6; cursor: default; }
+#startNote { margin-top: 18px; font-size: 14px; color: var(--muted); min-height: 1.4em; }
+#startNote.err { color: var(--bad); }
+#overlay { position: fixed; inset: 0; z-index: 20; display: none; align-items: center; justify-content: center; flex-direction: column; text-align: center;
+background: rgba(0,0,0,.45); pointer-events: none; padding: 24px; }
+#overlay.show { display: flex; }
+#overlay .num { font-size: clamp(90px, 22vw, 180px); font-weight: 800; line-height: 1; color: #fff; text-shadow: 0 6px 40px rgba(0,0,0,.6); }
+#overlay .msg { font-size: clamp(20px, 4.5vw, 30px); font-weight: 700; margin-top: 10px; text-shadow: 0 2px 12px rgba(0,0,0,.7); }
+#overlay .sub { font-size: 16px; color: #ddd; margin-top: 8px; text-shadow: 0 2px 10px rgba(0,0,0,.7); }
+#hud { position: fixed; top: calc(12px + var(--safe-t)); left: 12px; z-index: 10; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 7px 12px; border-radius: 999px; background: var(--panel);
+border: 1px solid var(--line); font-size: 14px; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); transition: background .15s, border-color .15s; white-space: nowrap; }
+.pill .dot { width: 8px; height: 8px; border-radius: 50%; background: #555; transition: background .15s; }
+.pill.on .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.pill.flash { background: rgba(255, 138, 61, .55); border-color: var(--accent); }
+.meter { width: 44px; height: 6px; border-radius: 3px; background: rgba(255,255,255,.12); overflow: hidden; }
+.meter i { display: block; height: 100%; width: 0%; background: linear-gradient(90deg, #7ee08a, #ffd36b 70%, #ff6b6b); }
+#fps { font-variant-numeric: tabular-nums; color: var(--muted); }
+#rec { display: none; color: #fff; background: rgba(200, 30, 30, .85); border-color: #ff6b6b; }
+#rec.show { display: inline-flex; }
+#rec .dot { background: #fff; animation: blink 1s infinite; }
+@keyframes blink { 50% { opacity: .2; } }
+#bar { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(14px + var(--safe-b)); z-index: 10; width: min(980px, calc(100% - 20px));
+display: flex; flex-direction: column; gap: 10px; padding: 12px; border-radius: 22px; background: var(--panel); border: 1px solid var(--line);
+backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+.row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; align-items: center; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px; padding: 10px 16px; border-radius: 14px;
+border: 1px solid var(--line); background: rgba(255,255,255,.06); font-weight: 650; font-size: 16px; cursor: pointer; transition: background .15s, transform .1s; }
+.btn:hover { background: rgba(255,255,255,.12); }
+.btn:active { transform: scale(.97); }
+.btn.primary { background: linear-gradient(180deg, var(--accent2), var(--accent)); color: #1b0f05; border-color: transparent; }
+.btn.active { background: rgba(255, 138, 61, .22); border-color: var(--accent); }
+.btn.recording { background: #c81e1e; border-color: #ff6b6b; color: #fff; }
+.btn .ico { font-size: 19px; line-height: 1; }
+.slider { display: flex; align-items: center; gap: 10px; padding: 6px 14px; min-height: 48px; border-radius: 14px; border: 1px solid var(--line); background: rgba(255,255,255,.04); }
+.slider label { font-size: 15px; color: var(--muted); white-space: nowrap; }
+.slider output { min-width: 2ch; text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+input[type=range] { -webkit-appearance: none; appearance: none; width: 160px; height: 28px; background: transparent; }
+input[type=range]::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: rgba(255,255,255,.18); }
+input[type=range]::-moz-range-track { height: 6px; border-radius: 3px; background: rgba(255,255,255,.18); }
+input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 24px; height: 24px; margin-top: -9px; border-radius: 50%; background: var(--accent2); border: 0; box-shadow: 0 2px 8px rgba(0,0,0,.4); }
+input[type=range]::-moz-range-thumb { width: 24px; height: 24px; border-radius: 50%; background: var(--accent2); border: 0; }
+.chk { display: inline-flex; align-items: center; gap: 8px; min-height: 48px; padding: 6px 14px; border-radius: 14px; border: 1px solid var(--line); background: rgba(255,255,255,.04); cursor: pointer; font-size: 15px; }
+.chk input { width: 20px; height: 20px; accent-color: var(--accent); }
+#hint { text-align: center; color: var(--muted); font-size: 14px; }
+#hint b { color: var(--text); }
+#bar { transition: opacity .25s; }
+#bar.dim { opacity: .35; }
+#bar.dim:hover { opacity: 1; }
+#toasts { position: fixed; top: calc(62px + var(--safe-t)); left: 50%; transform: translateX(-50%); z-index: 25; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; width: min(560px, calc(100% - 24px)); }
+.toast { padding: 11px 16px; border-radius: 14px; background: rgba(20,20,24,.92); border: 1px solid var(--line); font-size: 15px; text-align: center;
+box-shadow: 0 8px 30px rgba(0,0,0,.4); animation: tin .25s ease; }
+.toast.warn { border-color: rgba(255, 179, 107, .6); }
+.toast.err { border-color: rgba(255, 107, 107, .7); }
+@keyframes tin { from { opacity: 0; transform: translateY(-6px); } }
+body.clean #hud, body.clean #bar, body.clean #toasts { display: none !important; }
+body.clean #stage { cursor: none; }
+#cleanHint { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 12; padding: 10px 16px; border-radius: 12px; background: rgba(0,0,0,.7);
+color: #ddd; font-size: 14px; opacity: 0; pointer-events: none; transition: opacity .6s; text-align: center; }
+#cleanHint.show { opacity: 1; }
+@media (max-width: 640px) {
+.btn { padding: 8px 12px; font-size: 15px; min-height: 46px; }
+.btn .txt-long { display: none; }
+input[type=range] { width: 110px; }
+#bar { padding: 10px; gap: 8px; }
+#hint { display: none; }
+}
+@media (max-height: 500px) and (orientation: landscape) {
+#bar { width: auto; max-width: calc(100% - 20px); padding: 8px; }
+#hint { display: none; }
+.btn { min-height: 42px; }
+}
+</style>
+</head>
+<body>
+<div id="stage">
+<canvas id="view"></canvas>
+<video id="video" playsinline muted autoplay></video>
+</div>
+<div id="hud" hidden>
+<span class="pill" id="earPill" title="Микрофон слышит щелчки"><span class="dot"></span>👂 <span id="earTxt">слышу щелчки</span> <span class="meter"><i id="meterFill"></i></span></span>
+<span class="pill" id="handPill" title="Рука видна в кадре"><span class="dot"></span>✋ <span id="handTxt">рука видна</span></span>
+<span class="pill" id="fpsPill"><span id="fps">— FPS</span></span>
+<span class="pill" id="rec"><span class="dot"></span>REC <span id="recTime">0:00</span></span>
+</div>
+<div id="toasts"></div>
+<div id="bar" hidden>
+<div class="row">
+<button class="btn primary" id="snapBtn" title="Пробел"><span class="ico">🫰</span> Щёлкнуть</button>
+<button class="btn" id="bgBtn" title="Клавиша B"><span class="ico">🖼️</span> Переснять фон</button>
+<button class="btn active" id="mirrorBtn" title="Клавиша M"><span class="ico">↔️</span> Зеркало</button>
+<button class="btn" id="recBtn" title="Клавиша R"><span class="ico">⏺️</span> <span id="recLabel">Записать видео</span></button>
+<button class="btn" id="fsBtn" title="Клавиша F"><span class="ico">⛶</span> <span class="txt-long">Полный экран</span><span class="txt-short"></span></button>
+<button class="btn" id="cleanBtn" title="Клавиша H"><span class="ico">🎬</span> Чистый режим</button>
+<button class="btn" id="setBtn" title="Настройки"><span class="ico">⚙️</span></button>
+</div>
+<div class="row" id="setRow" hidden>
+<div class="slider">
+<label for="sens">Чувствительность щелчка</label>
+<input type="range" id="sens" min="1" max="10" step="1" value="6">
+<output id="sensOut">6</output>
+</div>
+<label class="chk"><input type="checkbox" id="needHand" checked> Нужна рука в кадре</label>
+<label class="chk"><input type="checkbox" id="fxSound" checked> Звук эффекта</label>
+</div>
+<div id="hint" hidden>Щёлкни пальцами в кадре — исчезнешь. Ещё щелчок — вернёшься. Запасной вариант: <b>пробел</b> или <b>тап</b> по картинке.</div>
+</div>
+<div id="overlay"><div class="num" id="ovNum"></div><div class="msg" id="ovMsg"></div><div class="sub" id="ovSub"></div></div>
+<div id="cleanHint">Чистый режим. Вернуть кнопки: клавиша <b>H</b> / <b>Esc</b> или долгое нажатие на экран</div>
+<div id="start">
+<div id="dust"></div>
+<div class="card">
+<h1>Щелчок</h1>
+<p>Щёлкни пальцами — и рассыпься в пыль. Щёлкни ещё раз — и вернись. Нужен доступ к камере и микрофону.</p>
+<button class="big" id="startBtn">▶ Старт</button>
+<div id="startNote"></div>
+</div>
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
