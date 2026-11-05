@@ -14,6 +14,8 @@ const LIFE_MIN = 0.9, LIFE_MAX = 1.75;
 const EFFECT_T = WAVE_TIME + NOISE_DELAY * 2 + LIFE_MAX + 0.05;
 const COOLDOWN_MS = 1500;
 const ASM_SKIP = 0.9;       // возврат начинается сразу с летящей пыли (без паузы)
+const MAXP = IS_MOBILE ? 70000 : 160000;   // максимум частиц
+const NOISE_N = 256;
 const $ = (id) => document.getElementById(id);
 const video = $('video');
 const canvas = $('view');
@@ -21,12 +23,11 @@ const ui = {
 start: $('start'), startBtn: $('startBtn'), startNote: $('startNote'),
 hud: $('hud'), bar: $('bar'), toasts: $('toasts'),
 overlay: $('overlay'), ovNum: $('ovNum'), ovMsg: $('ovMsg'), ovSub: $('ovSub'),
-earPill: $('earPill'), earTxt: $('earTxt'), meterFill: $('meterFill'),
 handPill: $('handPill'), handTxt: $('handTxt'), fps: $('fps'),
 rec: $('rec'), recTime: $('recTime'),
 snapBtn: $('snapBtn'), bgBtn: $('bgBtn'), mirrorBtn: $('mirrorBtn'), recBtn: $('recBtn'), recLabel: $('recLabel'),
 fsBtn: $('fsBtn'), cleanBtn: $('cleanBtn'), sens: $('sens'), sensOut: $('sensOut'),
-needHand: $('needHand'), fxSound: $('fxSound'), cleanHint: $('cleanHint'),
+fxSound: $('fxSound'), cleanHint: $('cleanHint'),
 };
 const store = {
 get(k, d) { try { const v = localStorage.getItem('snap.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
@@ -35,7 +36,6 @@ set(k, v) { try { localStorage.setItem('snap.' + k, JSON.stringify(v)); } catch 
 const settings = {
 mirror: store.get('mirror', true),
 sens: store.get('sens', 6),
-needHand: store.get('needHand', true),
 fxSound: store.get('fxSound', true),
 };
 function toast(text, kind = '', ms = 3200) {
@@ -78,7 +78,8 @@ segmenter: null, segKind: 'none', segPersonFromBg: true,
 hands: null,
 audioCtx: null, micStream: null, recDest: null, fxBus: null, detector: null,
 handHistory: [],            // {t, hands:[{r, pt:[x,y]}]}
-pendingSnap: null,
+pinch: null, lastSnapAt: -1e9,
+origin0: [0.5, 0.4], c0: [0.5, 0.5], shift: [0, 0], emitted: 0, prevTau: -1, prevMask: null,
 frame: 0,
 };
 ui.startBtn.addEventListener('click', start);
@@ -89,14 +90,14 @@ ui.startNote.classList.remove('err');
 try {
 if (!window.isSecureContext) throw new Error('Нужно открыть сайт по https:// — иначе браузер не даст камеру.');
 if (!navigator.mediaDevices?.getUserMedia) throw new Error('Этот браузер не умеет работать с камерой. Открой в Chrome, Edge или Safari.');
-ui.startNote.textContent = 'Разреши доступ к камере и микрофону…';
+ui.startNote.textContent = 'Разреши доступ к камере (и микрофону — для записи видео со звуком)…';
 const AC = window.AudioContext || window.webkitAudioContext;
 app.audioCtx = new AC({ latencyHint: 'interactive' });
 app.audioCtx.resume?.();
-const stream = await navigator.mediaDevices.getUserMedia({
-video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-audio: TEST_MODE ? false : { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
-}).catch((e) => {
+const vOpts = { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+const stream = await navigator.mediaDevices.getUserMedia({ video: vOpts, audio: !TEST_MODE })
+.catch(async (e) => {
+if (!TEST_MODE && e && e.name !== 'NotReadableError') { try { return await navigator.mediaDevices.getUserMedia({ video: vOpts }); } catch (e2) { e = e2; } }
 if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) throw new Error('Доступ к камере/микрофону запрещён. Разреши его в настройках сайта (значок замка в адресной строке) и обнови страницу.');
 if (e && e.name === 'NotFoundError') throw new Error('Камера или микрофон не найдены.');
 if (e && e.name === 'NotReadableError') throw new Error('Камера занята другой программой (Zoom, OBS?). Закрой её и обнови страницу.');
@@ -311,13 +312,13 @@ maxFilter(D2, conf, 2, w, h);
 function processMask() {
 const w = app.sw, h = app.sh, N = w * h;
 const hiddenish = app.mode !== 'visible';
-const up = hiddenish ? 0.9 : 0.7, down = hiddenish ? 0.22 : 0.45;
+const up = hiddenish ? 0.9 : 0.7, down = hiddenish ? 0.1 : 0.45;
 for (let i = 0; i < N; i++) {
 const c = conf[i], s = maskS[i];
 maskS[i] = s + (c - s) * (c > s ? up : down);
 }
-const r2 = Math.max(2, Math.round(w * 0.014));
-const r3 = Math.max(6, Math.round(w * 0.045));
+const r2 = Math.max(3, Math.round(w * 0.024));
+const r3 = Math.max(10, Math.round(w * 0.07));
 maxFilter(maskS, D2, r2, w, h);
 maxFilter(D2, D3, r3 - r2, w, h);
 for (let i = 0, j = 0; i < N; i++, j += 4) {
@@ -355,11 +356,21 @@ const ts = Math.max(handTs + 1, Math.round(now)); handTs = ts;
 let res;
 try { res = app.hands.detectForVideo(video, ts); } catch (e) { console.warn('hand error', e); return; }
 const list = [];
+const T = gestureThr(), asp = app.vw / app.vh;
 for (const lm of res.landmarks || []) {
-const d = (a, b) => Math.hypot((lm[a].x - lm[b].x) * app.vw / app.vh, lm[a].y - lm[b].y);
+const d = (a, b) => Math.hypot((lm[a].x - lm[b].x) * asp, lm[a].y - lm[b].y);
 const palm = Math.max(1e-4, d(0, 9));
 const r = d(4, 12) / palm;              // большой ↔ средний палец
-list.push({ r, pt: [(lm[4].x + lm[12].x) / 2, (lm[4].y + lm[12].y) / 2], wrist: [lm[0].x, lm[0].y] });
+const curl = d(12, 0) / palm;           // кончик среднего пальца ↔ запястье
+const pt = [(lm[4].x + lm[12].x) / 2, (lm[4].y + lm[12].y) / 2];
+list.push({ r, pt });
+// Щелчок = пальцы были сжаты, потом средний резко сорвался вниз к ладони
+if (r < T.pinch) {
+app.pinch = { t: now, pt, mid: [lm[12].x * asp, lm[12].y], palm };
+} else if (app.pinch && now - app.pinch.t < T.win && r > T.rel && curl < T.curl) {
+const mv = Math.hypot(lm[12].x * asp - app.pinch.mid[0], lm[12].y - app.pinch.mid[1]) / app.pinch.palm;
+if (mv > T.move) { const o = app.pinch.pt; app.pinch = null; onGesture(o, now); }
+}
 }
 app.handHistory.push({ t: now, hands: list });
 while (app.handHistory.length && now - app.handHistory[0].t > 2500) app.handHistory.shift();
@@ -372,84 +383,6 @@ if (h.hands.length) return true;
 }
 return false;
 }
-function findSnapHand(onset) {
-let best = null, seen = false;
-for (const e of app.handHistory) {
-if (e.t < onset - 950 || e.t > onset + 220) continue;
-for (const h of e.hands) {
-seen = true;
-if (h.r < 0.55 && (!best || h.r < best.r)) best = h;
-}
-}
-return { seen, best };
-}
-const WORKLET_SRC = `
-class SnapDetector extends AudioWorkletProcessor {
-constructor() {
-super();
-const fc = 2400, Q = Math.SQRT1_2, w0 = 2 * Math.PI * fc / sampleRate, al = Math.sin(w0) / (2 * Q), cw = Math.cos(w0);
-const a0 = 1 + al;
-this.b0 = (1 + cw) / 2 / a0; this.b1 = -(1 + cw) / a0; this.b2 = (1 + cw) / 2 / a0;
-this.a1 = -2 * cw / a0; this.a2 = (1 - al) / a0;
-this.x1 = this.x2 = this.y1 = this.y2 = 0;
-this.hist = new Float32Array(16); this.hi = 0;
-this.floor = 1e-7; this.sens = 6; this.block = 0; this.refractory = 0;
-this.cand = null; this.lvl = 0; this.lvlN = 0; this.warm = 0;
-this.port.onmessage = (e) => { if (e.data && e.data.sens) this.sens = e.data.sens; };
-}
-process(inputs) {
-const ch = inputs[0] && inputs[0][0];
-if (!ch) return true;
-let hp = 0, full = 0;
-const { b0, b1, b2, a1, a2 } = this;
-let { x1, x2, y1, y2 } = this;
-for (let i = 0; i < ch.length; i++) {
-const x = ch[i];
-const y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-x2 = x1; x1 = x; y2 = y1; y1 = y;
-hp += y * y; full += x * x;
-}
-this.x1 = x1; this.x2 = x2; this.y1 = y1; this.y2 = y2;
-hp /= ch.length; full /= ch.length;
-this.block++;
-let ref = 0; for (let k = 4; k < 16; k++) ref += this.hist[(this.hi - k + 32) % 16]; ref /= 12;
-this.hist[this.hi] = hp; this.hi = (this.hi + 1) % 16;
-if (hp < this.floor) this.floor = this.floor * 0.9 + hp * 0.1; else this.floor = this.floor * 0.9993 + hp * 0.0007;
-this.floor = Math.max(this.floor, 1e-10);
-this.warm++;
-const s = this.sens;
-const ratio = Math.pow(10, (33 - s * 2.6) / 10);           // во сколько раз громче фона
-const absMin = Math.pow(10, (-38 - s * 2.4) / 10);         // абсолютный минимум энергии
-const blockSec = ch.length / sampleRate;
-if (this.refractory > 0) this.refractory -= blockSec;
-if (this.cand) {
-const c = this.cand; c.n++;
-if (c.n <= 6) { if (hp > c.peak) c.peak = hp; }
-else if (c.n >= 22 && c.n <= 34) { c.tail += hp; c.tn++; }
-if (c.n > 34) {
-const tail = c.tail / Math.max(1, c.tn);
-if (tail < c.peak * 0.06) {
-this.port.postMessage({ type: 'snap', ago: c.n * blockSec, db: 10 * Math.log10(c.peak / this.floor) });
-this.refractory = 0.25;
-} else {
-this.port.postMessage({ type: 'reject', why: 'long' });
-}
-this.cand = null;
-}
-} else if (this.refractory <= 0 && this.warm > 150) {
-const base = Math.max(ref, this.floor);
-if (hp > this.floor * ratio && hp > absMin && hp > base * 7 && hp / (full + 1e-12) > 0.10) {
-this.cand = { peak: hp, n: 0, tail: 0, tn: 0 };
-}
-}
-const lvl = 10 * Math.log10((hp + 1e-12) / (this.floor * ratio));
-if (lvl > this.lvl) this.lvl = lvl;
-if (++this.lvlN >= 18) { this.port.postMessage({ type: 'level', v: this.lvl }); this.lvl = -99; this.lvlN = 0; }
-return true;
-}
-}
-registerProcessor('snap-detector', SnapDetector);
-`;
 async function setupAudioGraph(stream) {
 const ctx = app.audioCtx;
 app.recDest = ctx.createMediaStreamDestination();
@@ -460,65 +393,29 @@ app.fxOut = ctx.createGain();
 app.fxOut.gain.value = settings.fxSound ? 1 : 0;
 app.fxBus.connect(app.fxOut);
 app.fxOut.connect(ctx.destination);
-if (!stream.getAudioTracks().length) { setEar(false, 'нет микрофона'); return; }
-const mic = ctx.createMediaStreamSource(stream);
-mic.connect(app.recDest);           // микрофон идёт в запись видео (но не в колонки)
-try {
-const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }));
-await ctx.audioWorklet.addModule(url);
-const node = new AudioWorkletNode(ctx, 'snap-detector', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
-const mute = ctx.createGain(); mute.gain.value = 0;
-mic.connect(node); node.connect(mute); mute.connect(ctx.destination);
-node.port.postMessage({ sens: settings.sens });
-node.port.onmessage = onDetectorMessage;
-app.detector = node;
-setEar(true);
-} catch (e) {
-console.warn('AudioWorklet недоступен', e);
-setEar(false, 'не слышу');
-toast('Микрофон не работает в этом браузере — щёлкай пробелом или тапом.', 'warn', 6000);
+if (stream.getAudioTracks().length) ctx.createMediaStreamSource(stream).connect(app.recDest);
 }
+function gestureThr() {
+const s = settings.sens;
+return { pinch: 0.30 + 0.03 * s, rel: 0.86 - 0.02 * s, curl: 1.25 + 0.045 * s, move: 0.5 - 0.03 * s, win: 300 + 25 * s };
 }
-function setEar(on, txt) {
-ui.earPill.classList.toggle('on', on);
-ui.earTxt.textContent = txt || 'слышу щелчки';
+let gState = '';
+function setGesture(st) {
+if (st === gState) return;
+gState = st;
+ui.handPill.classList.toggle('on', st !== 'none');
+ui.handPill.classList.toggle('flash', st === 'snap');
+ui.handTxt.textContent = st === 'snap' ? 'щёлк!' : st === 'pinch' ? 'пальцы сжаты — щёлкай' : st === 'hand' ? 'рука видна' : 'руки не видно';
 }
-let earFlashT = 0;
-function onDetectorMessage(e) {
-const m = e.data;
-if (m.type === 'level') {
-const pct = clamp((m.v + 25) / 30, 0, 1) * 100;
-ui.meterFill.style.width = pct.toFixed(0) + '%';
-} else if (m.type === 'snap') {
-const onset = performance.now() - m.ago * 1000 - 15;
-ui.earPill.classList.add('flash');
-clearTimeout(earFlashT); earFlashT = setTimeout(() => ui.earPill.classList.remove('flash'), 350);
-onSnapHeard(onset);
-}
+function onGesture(origin, now) {
+app.lastSnapAt = now;
+if (!app.bgReady) { toastOnce('nobg', 'Сначала нужно снять фон.', 'warn'); return; }
+trigger(origin);
 }
 function canTrigger(now) {
 if (!app.bgReady || app.capturing) return false;
 if (app.mode === 'dissolving' || app.mode === 'assembling') return false;
 return now - app.lastTriggerAt > COOLDOWN_MS;
-}
-function onSnapHeard(onset) {
-if (app.pendingSnap) return;
-const now = performance.now();
-if (!app.bgReady) { toastOnce('nobg', 'Сначала нужно снять фон.', 'warn'); return; }
-if (!canTrigger(now)) return;
-const wait = Math.max(0, onset + 230 - now);
-app.pendingSnap = setTimeout(() => {
-app.pendingSnap = null;
-const t = performance.now();
-if (!canTrigger(t)) return;
-const useHand = settings.needHand && app.hands;
-const { seen, best } = findSnapHand(onset);
-if (useHand) {
-if (!seen) { toastOnce('nohand', 'Слышу щелчок, но не вижу руку ✋ — подними руку в кадр.', 'warn'); return; }
-if (!best) { toastOnce('nopinch', 'Рука видна, но щелчка пальцами не заметил — попробуй ещё раз.', 'warn'); return; }
-}
-trigger(best ? best.pt : null);
-}, wait);
 }
 function trigger(origin) {
 const now = performance.now();
@@ -550,14 +447,18 @@ const d = Math.hypot(dx, dy); if (d > maxD) maxD = d;
 }
 }
 app.spread = WAVE_TIME / maxD;
-app.origin = origin;
+app.origin0 = origin;
+app.c0 = [st.cx, st.cy];
+app.shift = [0, 0];
 let dir = Math.sign(st.cx - origin[0]);
 if (Math.abs(st.cx - origin[0]) < 0.02) dir = Math.random() < 0.5 ? -1 : 1;
 app.wind = [dir * 0.42, -0.16];
-gl_snapshot();
 app.mode = kind;
 app.effectStart = performance.now();
 app.lastTriggerAt = app.effectStart;
+app.emitted = 0; app.prevTau = -1;
+app.prevMask = Float32Array.from(maskS);
+if (kind === 'assembling') emitAssemble();
 playDustSound(kind === 'assembling');
 }
 let noiseBuf = null;
@@ -668,17 +569,16 @@ app.capturing = false;
 ui.bgBtn.disabled = false;
 }
 }
-let gl, progComp, progBg, progPart, texVideo, texSnap, texMask, texSnapMask, bgTex = [], bgFbo = [], bgIdx = 0, bgW = 0, bgH = 0;
-let partVao, partCount = 0, quadVao, maxPointSize = 64;
+let gl, progComp, progBg, progPart, texVideo, texNoise, texMask, pdata, partBuf, noiseU8, bgTex = [], bgFbo = [], bgIdx = 0, bgW = 0, bgH = 0;
+let partVao = null, quadVao, maxPointSize = 64;
 const GLSL_NOISE = `
-uniform vec2 uOrigin; uniform float uAspect; uniform float uSpread;
+uniform vec2 uOrigin; uniform float uAspect; uniform float uSpread; uniform vec2 uShift; uniform sampler2D uNoise;
 float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
 float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); vec2 u = f*f*(3.0-2.0*f);
 return mix(mix(hash12(i), hash12(i+vec2(1,0)), u.x), mix(hash12(i+vec2(0,1)), hash12(i+vec2(1,1)), u.x), u.y); }
-float fbm(vec2 p){ float s = 0.0, a = 0.5; for (int i = 0; i < 4; i++){ s += a*vnoise(p); p = p*2.03 + vec2(17.1, 9.3); a *= 0.5; } return s; }
 float delayAt(vec2 uv){
 vec2 d = (uv - uOrigin) * vec2(uAspect, 1.0);
-float n = fbm(uv * vec2(uAspect, 1.0) * 7.0) - 0.47;
+float n = texture(uNoise, uv - uShift).r - 0.47;
 return length(d) * uSpread + n * ${(NOISE_DELAY * 2).toFixed(3)} + ${NOISE_DELAY.toFixed(3)};
 }`;
 const VS_QUAD = `#version 300 es
@@ -702,9 +602,9 @@ vec4 mk = texture(uMask, uv);
 float zone = mk.b;
 vec3 b = texture(uBg, uv).rgb * mix(vec3(1.0), uGain, smoothstep(0.0, 0.3, zone));
 float m = mix(mk.r, mk.g, uDil);
-m = smoothstep(0.22, 0.58, m);
+m = smoothstep(0.12, 0.45, m);
 float diff = length(v - b);
-float halo = smoothstep(0.02, 0.25, zone) * smoothstep(0.09, 0.2, diff) * uDil;
+float halo = smoothstep(0.02, 0.2, zone) * smoothstep(0.05, 0.14, diff) * uDil;
 float rep = clamp(max(m, halo), 0.0, 1.0);
 float hide = 1.0, x = 1.0;
 if (uMode == 1 || uMode == 3) { float d = delayAt(uv); x = uTau - d; hide = smoothstep(-0.035, 0.035, x); }
@@ -735,9 +635,8 @@ outColor = vec4(o, 1.0);
 }`;
 const VS_PART = `#version 300 es
 precision highp float;
-in vec2 aHome; in vec4 aRand;
-uniform sampler2D uSnap, uSnapMask;
-uniform float uTau, uMirror, uCell, uMaxPt; uniform vec2 uWind;
+in vec2 aPos0; in float aT0; in vec3 aCol; in vec4 aRand;
+uniform float uT, uDir, uMirror, uCell, uMaxPt; uniform vec2 uWind, uShift2;
 out vec4 vCol; out float vSoft;
 ${GLSL_NOISE}
 vec2 curl(vec2 p){
@@ -750,33 +649,30 @@ return vec2(a - b, -(c - d)) / (2.0 * e);
 }
 void cull(){ gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; vCol = vec4(0.0); vSoft = 0.0; }
 void main(){
-float m = texture(uSnapMask, aHome).r;
-if (m < 0.55) { cull(); return; }
-float d = delayAt(aHome) - 0.02 + aRand.x * 0.06;
 float life = ${LIFE_MIN.toFixed(2)} + aRand.y * ${(LIFE_MAX - LIFE_MIN).toFixed(2)};
-float local = uTau - d;
+float local = uDir > 0.0 ? uT - aT0 : aT0 - uT;
 if (local < 0.0 || local > life) { cull(); return; }
 float p = local / life;
 float gust = p * p * 1.15 + p * 0.22;
 vec2 wind = uWind * (0.55 + aRand.z * 0.9);
 vec2 off = wind * gust;
 off.y -= (0.03 + aRand.w * 0.10) * p * p;
-vec2 cp = aHome * vec2(uAspect, 1.0) * 2.5 + vec2(uTau * 0.25, aRand.x * 3.0);
+vec2 cp = aPos0 * vec2(uAspect, 1.0) * 2.5 + vec2(uT * 0.25, aRand.x * 3.0);
 off += curl(cp) * 0.018 * p * (0.6 + aRand.w);
 float ang = aRand.z * 6.2832 + local * (3.0 + aRand.w * 6.0);
 off += vec2(cos(ang), sin(ang)) * (0.004 + 0.01 * aRand.y) * p;
 off.x /= uAspect;
-vec2 pos = aHome + off;
+vec2 pos = aPos0 + uShift2 + off;
 float x = uMirror > 0.5 ? 1.0 - pos.x : pos.x;
 gl_Position = vec4(x * 2.0 - 1.0, 1.0 - pos.y * 2.0, 0.0, 1.0);
-vec3 c = texture(uSnap, aHome).rgb;
+vec3 c = aCol;
 float lum = dot(c, vec3(0.299, 0.587, 0.114));
 vec3 ash = vec3(0.07, 0.065, 0.06) + vec3(0.55, 0.52, 0.5) * lum * 0.45;
 vec3 col = mix(c, ash, smoothstep(0.04, 0.5, p));
 float ember = step(0.72, aRand.w) * exp(-local * 9.0);
 col += vec3(1.0, 0.45, 0.12) * ember * 0.9;
 float alpha = (1.0 - smoothstep(0.55, 1.0, p)) * 0.95;
-float size = uCell * (1.25 + aRand.z * 0.9) * (1.0 - 0.65 * p);
+float size = uCell * (1.0 + aRand.z * 0.8) * (1.0 - 0.6 * p);
 gl_PointSize = clamp(size, 1.0, uMaxPt);
 vSoft = clamp(size, 1.0, 8.0);
 vCol = vec4(col * alpha, alpha);
@@ -828,7 +724,7 @@ if (!gl) throw new Error('Этот браузер не поддерживает 
 canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); toast('Видеокарта перезапустилась — обнови страницу.', 'err', 10000); });
 progComp = program(VS_QUAD, FS_COMP, ['aPos']);
 progBg = program(VS_QUAD, FS_BG, ['aPos']);
-progPart = program(VS_PART, FS_PART, ['aHome', 'aRand']);
+progPart = program(VS_PART, FS_PART, ['aPos0', 'aT0', 'aCol', 'aRand']);
 maxPointSize = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1] || 64;
 quadVao = gl.createVertexArray();
 gl.bindVertexArray(quadVao);
@@ -836,7 +732,7 @@ const qb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qb);
 gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
 gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 gl.bindVertexArray(null);
-texVideo = makeTex(); texSnap = makeTex(); texMask = makeTex(); texSnapMask = makeTex();
+texVideo = makeTex(); texMask = makeTex(); texNoise = makeTex();
 gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
 gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
 resize();
@@ -860,26 +756,109 @@ canvas.style.height = Math.floor(app.vh * s) + 'px';
 }
 window.addEventListener('resize', () => { if (app.vw) fitCanvas(); });
 function buildParticles() {
-const aspect = app.vw / app.vh;
-const target = IS_MOBILE ? 38000 : 72000;     // частиц на весь кадр (рисуются только те, что на теле)
-const pw = Math.round(Math.sqrt(target * aspect)), ph = Math.round(pw / aspect);
-partCount = pw * ph;
-const home = new Float32Array(partCount * 2), rnd = new Float32Array(partCount * 4);
-let i = 0;
-for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++, i++) {
-home[i * 2] = (x + 0.15 + Math.random() * 0.7) / pw;
-home[i * 2 + 1] = (y + 0.15 + Math.random() * 0.7) / ph;
-rnd[i * 4] = Math.random(); rnd[i * 4 + 1] = Math.random(); rnd[i * 4 + 2] = Math.random(); rnd[i * 4 + 3] = Math.random();
-}
-app.cellPx = app.vw / pw;
-if (partVao) gl.deleteVertexArray(partVao);
+app.cellPx = (app.vw / app.sw) * (IS_MOBILE ? 1.15 : 0.95);
+pdata = new Float32Array(MAXP * 10);
+if (!partVao) {
 partVao = gl.createVertexArray();
 gl.bindVertexArray(partVao);
-const b1 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b1); gl.bufferData(gl.ARRAY_BUFFER, home, gl.STATIC_DRAW);
-gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-const b2 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b2); gl.bufferData(gl.ARRAY_BUFFER, rnd, gl.STATIC_DRAW);
-gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0);
+partBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, partBuf);
+gl.bufferData(gl.ARRAY_BUFFER, MAXP * 40, gl.DYNAMIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 40, 0);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 40, 8);
+gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 40, 12);
+gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 40, 24);
 gl.bindVertexArray(null);
+}
+// шумовая карта для рваного края волны (одна и та же на CPU и в шейдере)
+const N = NOISE_N, asp = app.vw / app.vh;
+const hash = (x, y) => { const h = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return h - Math.floor(h); };
+const vn = (x, y) => { const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy, ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+const a = hash(ix, iy), b = hash(ix + 1, iy), c = hash(ix, iy + 1), d = hash(ix + 1, iy + 1);
+return (a + (b - a) * ux) * (1 - uy) + (c + (d - c) * ux) * uy; };
+noiseU8 = new Uint8Array(N * N);
+const rgba = new Uint8Array(N * N * 4);
+for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+let px = (x + 0.5) / N * asp * 7, py = (y + 0.5) / N * 7, sum = 0, amp = 0.5;
+for (let o = 0; o < 4; o++) { sum += amp * vn(px, py); px = px * 2.03 + 17.1; py = py * 2.03 + 9.3; amp *= 0.5; }
+const v = Math.round(clamp(sum, 0, 1) * 255);
+noiseU8[y * N + x] = v; rgba[(y * N + x) * 4] = v; rgba[(y * N + x) * 4 + 3] = 255;
+}
+gl.bindTexture(gl.TEXTURE_2D, texNoise);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, N, N, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+}
+function sampleNoise(u, v) {
+const N = NOISE_N;
+const x = u * N - 0.5, y = v * N - 0.5;
+const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+const w = (i) => ((i % N) + N) % N;
+const x0 = w(ix), x1 = w(ix + 1), y0 = w(iy), y1 = w(iy + 1);
+const a = noiseU8[y0 * N + x0], b = noiseU8[y0 * N + x1], c = noiseU8[y1 * N + x0], d = noiseU8[y1 * N + x1];
+return ((a + (b - a) * fx) * (1 - fy) + (c + (d - c) * fx) * fy) / 255;
+}
+function delayCPU(u, v) {
+const asp = app.vw / app.vh;
+const ox = app.origin0[0] + app.shift[0], oy = app.origin0[1] + app.shift[1];
+const n = sampleNoise(u - app.shift[0], v - app.shift[1]) - 0.47;
+return Math.hypot((u - ox) * asp, v - oy) * app.spread + n * NOISE_DELAY * 2 + NOISE_DELAY;
+}
+let flushFrom = 0;
+function pushParticle(u, v, t0, i4) {
+if (app.emitted >= MAXP) return;
+const o = app.emitted * 10;
+pdata[o] = u; pdata[o + 1] = v; pdata[o + 2] = t0;
+const j = (Math.random() - 0.5) * 12;
+pdata[o + 3] = clamp((segRGB[i4] + j) / 255, 0, 1); pdata[o + 4] = clamp((segRGB[i4 + 1] + j) / 255, 0, 1); pdata[o + 5] = clamp((segRGB[i4 + 2] + j) / 255, 0, 1);
+pdata[o + 6] = Math.random(); pdata[o + 7] = Math.random(); pdata[o + 8] = Math.random(); pdata[o + 9] = Math.random();
+app.emitted++;
+}
+function flushParticles() {
+if (app.emitted <= flushFrom) return;
+gl.bindBuffer(gl.ARRAY_BUFFER, partBuf);
+gl.bufferSubData(gl.ARRAY_BUFFER, flushFrom * 40, pdata, flushFrom * 10, (app.emitted - flushFrom) * 10);
+flushFrom = app.emitted;
+}
+const PER_PX = IS_MOBILE ? 1 : 2;
+// Исчезновение: частицы рождаются там, где тело СЕЙЧАС, в момент, когда его касается волна
+function emitDissolve(tau) {
+if (!segRGB) return;
+const prev = app.prevTau; app.prevTau = tau;
+const w = app.sw, h = app.sh, pm = app.prevMask;
+if (app.emitted === 0) flushFrom = 0;
+for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+const i = y * w + x;
+if (maskS[i] < 0.5) continue;
+const u = (x + 0.5) / w, v = (y + 0.5) / h;
+const d = delayCPU(u, v) - 0.02;
+let t0 = -1;
+if (d > prev && d <= tau) t0 = d;
+if (t0 < 0) continue;
+for (let k = 0; k < PER_PX; k++) pushParticle(u + (Math.random() - 0.5) / w, v + (Math.random() - 0.5) / h, t0, i * 4);
+}
+if (pm) pm.set(maskS);
+flushParticles();
+}
+// Возврат: пыль летит к телу, точки прилёта двигаются вместе с телом
+function emitAssemble() {
+if (!segRGB) return;
+flushFrom = 0;
+const TA = EFFECT_T - ASM_SKIP, w = app.sw, h = app.sh;
+for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+const i = y * w + x;
+if (maskS[i] < 0.5) continue;
+const u = (x + 0.5) / w, v = (y + 0.5) / h;
+const t0 = TA - delayCPU(u, v);
+for (let k = 0; k < PER_PX; k++) pushParticle(u + (Math.random() - 0.5) / w, v + (Math.random() - 0.5) / h, t0, i * 4);
+}
+flushParticles();
+}
+function updateShift() {
+const st = bodyStats();
+if (!st || st.area < 0.003) return;
+const tx = st.cx - app.c0[0], ty = st.cy - app.c0[1];
+app.shift[0] += (tx - app.shift[0]) * 0.5;
+app.shift[1] += (ty - app.shift[1]) * 0.5;
 }
 function gl_uploadBackground(rgba, w, h) {
 bgW = w; bgH = h;
@@ -896,21 +875,17 @@ bgTex.push(t); bgFbo.push(f);
 gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 bgIdx = 0;
 }
-function gl_snapshot() {
-gl.bindTexture(gl.TEXTURE_2D, texSnap);
-gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
-gl.bindTexture(gl.TEXTURE_2D, texSnapMask);
-gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, app.sw, app.sh, 0, gl.RGBA, gl.UNSIGNED_BYTE, maskU8);
-}
 function bindTex(unit, tex, loc) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(loc, unit); }
 function setNoiseUniforms(u) {
-gl.uniform2f(u.uOrigin, app.origin[0], app.origin[1]);
+gl.uniform2f(u.uOrigin, app.origin0[0] + app.shift[0], app.origin0[1] + app.shift[1]);
+gl.uniform2f(u.uShift, app.shift[0], app.shift[1]);
+if (u.uNoise) bindTex(5, texNoise, u.uNoise);
 gl.uniform1f(u.uAspect, app.vw / app.vh);
 gl.uniform1f(u.uSpread, app.spread);
 }
 const MODE_ID = { visible: 0, dissolving: 1, hidden: 2, assembling: 3 };
 let bgSeed = 0;
-function render(tau, dil) {
+function render(tau, dil, el) {
 if (app.bgReady && bgTex.length) {
 const src = bgIdx, dst = 1 - bgIdx;
 gl.bindFramebuffer(gl.FRAMEBUFFER, bgFbo[dst]);
@@ -952,15 +927,15 @@ gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 gl.useProgram(progPart.p);
 const p = progPart.u;
 setNoiseUniforms(p);
-gl.uniform1f(p.uTau, tau);
+gl.uniform1f(p.uT, el);
+gl.uniform1f(p.uDir, app.mode === 'dissolving' ? 1 : -1);
+if (app.mode === 'assembling') gl.uniform2f(p.uShift2, app.shift[0], app.shift[1]); else gl.uniform2f(p.uShift2, 0, 0);
 gl.uniform1f(p.uMirror, settings.mirror ? 1 : 0);
 gl.uniform1f(p.uCell, app.cellPx);
 gl.uniform1f(p.uMaxPt, maxPointSize);
 gl.uniform2f(p.uWind, app.wind[0], app.wind[1]);
-bindTex(0, texSnap, p.uSnap);
-bindTex(1, texSnapMask, p.uSnapMask);
 gl.bindVertexArray(partVao);
-gl.drawArrays(gl.POINTS, 0, partCount);
+if (app.emitted) gl.drawArrays(gl.POINTS, 0, app.emitted);
 gl.disable(gl.BLEND);
 }
 gl.bindVertexArray(null);
@@ -983,7 +958,8 @@ segCtx.drawImage(video, 0, 0, app.sw, app.sh);
 segRGB = segCtx.getImageData(0, 0, app.sw, app.sh).data;
 runSegmentation(now);
 processMask();
-if (app.frame % 2 === 0 || app.mode === 'hidden' || app.mode === 'visible') runHands(now);
+if (app.mode === 'dissolving' || app.mode === 'assembling') updateShift();
+runHands(now);
 gl.bindTexture(gl.TEXTURE_2D, texVideo);
 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
 gl.bindTexture(gl.TEXTURE_2D, texMask);
@@ -994,20 +970,20 @@ const el = (now - app.effectStart) / 1000;
 let tau = 0, dil = 0;
 if (app.mode === 'dissolving') {
 tau = el; dil = smooth01(0, 1.6, tau);
+emitDissolve(tau);
 if (el >= EFFECT_T) { app.mode = 'hidden'; app.lastTriggerAt = Math.max(app.lastTriggerAt, now - COOLDOWN_MS + 400); }
 } else if (app.mode === 'assembling') {
 tau = EFFECT_T - ASM_SKIP - el; dil = smooth01(0, 1.6, tau);
 if (tau <= 0) { app.mode = 'visible'; app.lastTriggerAt = Math.max(app.lastTriggerAt, now - COOLDOWN_MS + 400); }
 } else if (app.mode === 'hidden') { tau = EFFECT_T; dil = 1; }
-render(tau, dil);
+render(tau, dil, el);
 if (now - fpsT >= 1000) {
 ui.fps.textContent = Math.round(fpsN * 1000 / (now - fpsT)) + ' FPS';
 fpsN = 0; fpsT = now;
 }
 if (app.hands) {
 const hv = handVisibleRecently(now);
-ui.handPill.classList.toggle('on', hv);
-ui.handTxt.textContent = hv ? 'рука видна' : 'руки не видно';
+setGesture(now - app.lastSnapAt < 600 ? 'snap' : (app.pinch && now - app.pinch.t < 250) ? 'pinch' : hv ? 'hand' : 'none');
 } else if (app.frame === 5) { ui.handTxt.textContent = 'рука: выкл'; }
 }
 let recorder = null, recChunks = [], recStart = 0, recTimer = 0;
@@ -1059,7 +1035,6 @@ upd(); recTimer = setInterval(upd, 500);
 function applySettingsUI() {
 ui.mirrorBtn.classList.toggle('active', settings.mirror);
 ui.sens.value = settings.sens; ui.sensOut.textContent = settings.sens;
-ui.needHand.checked = settings.needHand;
 ui.fxSound.checked = settings.fxSound;
 }
 ui.snapBtn.addEventListener('click', () => manualSnap(null));
@@ -1077,9 +1052,7 @@ ui.fsBtn.addEventListener('click', toggleFullscreen);
 ui.cleanBtn.addEventListener('click', () => setClean(true));
 ui.sens.addEventListener('input', () => {
 settings.sens = +ui.sens.value; ui.sensOut.textContent = settings.sens; store.set('sens', settings.sens);
-app.detector?.port.postMessage({ sens: settings.sens });
 });
-ui.needHand.addEventListener('change', () => { settings.needHand = ui.needHand.checked; store.set('needHand', settings.needHand); });
 ui.fxSound.addEventListener('change', () => {
 settings.fxSound = ui.fxSound.checked; store.set('fxSound', settings.fxSound);
 if (app.fxOut) app.fxOut.gain.value = settings.fxSound ? 1 : 0;

@@ -128,8 +128,7 @@ input[type=range] { width: 110px; }
 <video id="video" playsinline muted autoplay></video>
 </div>
 <div id="hud" hidden>
-<span class="pill" id="earPill" title="Микрофон слышит щелчки"><span class="dot"></span>👂 <span id="earTxt">слышу щелчки</span> <span class="meter"><i id="meterFill"></i></span></span>
-<span class="pill" id="handPill" title="Рука видна в кадре"><span class="dot"></span>✋ <span id="handTxt">рука видна</span></span>
+<span class="pill" id="handPill" title="Что видит программа"><span class="dot"></span>🫰 <span id="handTxt">руки не видно</span></span>
 <span class="pill" id="fpsPill"><span id="fps">— FPS</span></span>
 <span class="pill" id="rec"><span class="dot"></span>REC <span id="recTime">0:00</span></span>
 </div>
@@ -146,14 +145,13 @@ input[type=range] { width: 110px; }
 </div>
 <div class="row" id="setRow" hidden>
 <div class="slider">
-<label for="sens">Чувствительность щелчка</label>
+<label for="sens">Чувствительность жеста</label>
 <input type="range" id="sens" min="1" max="10" step="1" value="6">
 <output id="sensOut">6</output>
 </div>
-<label class="chk"><input type="checkbox" id="needHand" checked> Нужна рука в кадре</label>
 <label class="chk"><input type="checkbox" id="fxSound" checked> Звук эффекта</label>
 </div>
-<div id="hint" hidden>Щёлкни пальцами в кадре — исчезнешь. Ещё щелчок — вернёшься. Запасной вариант: <b>пробел</b> или <b>тап</b> по картинке.</div>
+<div id="hint" hidden>Прижми большой палец к среднему и щёлкни (средний палец срывается вниз к ладони) — исчезнешь. Ещё щелчок — вернёшься. Запасной вариант: <b>пробел</b> или <b>тап</b> по картинке.</div>
 </div>
 <div id="overlay"><div class="num" id="ovNum"></div><div class="msg" id="ovMsg"></div><div class="sub" id="ovSub"></div></div>
 <div id="cleanHint">Чистый режим. Вернуть кнопки: клавиша <b>H</b> / <b>Esc</b> или долгое нажатие на экран</div>
@@ -161,7 +159,7 @@ input[type=range] { width: 110px; }
 <div id="dust"></div>
 <div class="card">
 <h1>Щелчок</h1>
-<p>Щёлкни пальцами — и рассыпься в пыль. Щёлкни ещё раз — и вернись. Нужен доступ к камере и микрофону.</p>
+<p>Щёлкни пальцами — и рассыпься в пыль. Щёлкни ещё раз — и вернись. Нужен доступ к камере.</p>
 <button class="big" id="startBtn">▶ Старт</button>
 <div id="startNote"></div>
 </div>
