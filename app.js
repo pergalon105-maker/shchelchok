@@ -1074,10 +1074,10 @@ async function loadEyes() {
 if (app.eyesLoading || app.eyes) return;
 app.eyesLoading = true; updateEyeUI();
 try {
-const { EyeContact } = await import('./eye-contact.js?v=4');
+const { EyeContact } = await import('./eye-swap.js?v=5');
 app.eyes = await EyeContact.create(app.vision ? { vision: app.vision } : {});
 app.eyes.strength = settings.eyeStrength / 100;
-if (!app.eyes.status.calibrated) toast('Совет: нажми «🎯 Калибровка» и 1.5 секунды смотри прямо в камеру — так глаза будут точнее.', '', 7000);
+if (!app.eyes.status.calibrated) toast('Нажми «🎯 Запомнить глаза» и посмотри прямо в объектив камеры — программа запомнит твои глаза.', '', 8000);
 } catch (err) {
 console.warn(err);
 toast('Не удалось загрузить «Взгляд в камеру» (нет интернета?).', 'err', 6000);
@@ -1101,10 +1101,19 @@ $('eyeStrength').addEventListener('input', () => {
 settings.eyeStrength = +$('eyeStrength').value; $('eyeStrengthOut').textContent = settings.eyeStrength; store.set('eyeStrength', settings.eyeStrength);
 if (app.eyes) app.eyes.strength = settings.eyeStrength / 100;
 });
-$('calibBtn').addEventListener('click', () => {
+let calibBusy = false;
+$('calibBtn').addEventListener('click', async () => {
 if (!app.eyes) { toast('Модуль глаз ещё загружается…', 'warn'); return; }
+if (calibBusy) return;
+calibBusy = true;
+for (let i = 3; i >= 1; i--) { overlay(i, 'Смотри прямо в объектив камеры', 'Не на экран — в саму камеру. Глаза открыты, голова прямо.'); await sleep(1000); }
+overlay('👁', 'Смотри в объектив… не моргай', '');
 app.eyes.calibrate();
-toast('🎯 Смотри прямо в камеру (в объектив) 1.5 секунды…', '', 2500);
+const t0 = performance.now();
+while (app.eyes.status.calibrating && performance.now() - t0 < 6000) await sleep(100);
+overlay(null);
+toast(app.eyes.status.calibrated ? '✅ Глаза запомнены! Теперь можно смотреть в экран.' : 'Не получилось — лицо должно быть видно, глаза открыты. Попробуй ещё раз.', app.eyes.status.calibrated ? '' : 'warn', 5000);
+calibBusy = false;
 });
 $('setBtn').addEventListener('click', () => {
 const r = $('setRow'), h = $('hint'); r.hidden = !r.hidden; h.hidden = r.hidden;
