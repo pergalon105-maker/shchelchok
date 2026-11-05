@@ -97,6 +97,7 @@ input[type=range]::-moz-range-thumb { width: 24px; height: 24px; border-radius: 
 #bar { transition: opacity .25s; }
 #bar.dim { opacity: .35; }
 #bar.dim:hover { opacity: 1; }
+#modeRow .btn { min-height: 44px; }
 #toasts { position: fixed; top: calc(62px + var(--safe-t)); left: 50%; transform: translateX(-50%); z-index: 25; display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; width: min(560px, calc(100% - 24px)); }
 .toast { padding: 11px 16px; border-radius: 14px; background: rgba(20,20,24,.92); border: 1px solid var(--line); font-size: 15px; text-align: center;
 box-shadow: 0 8px 30px rgba(0,0,0,.4); animation: tin .25s ease; }
@@ -129,11 +130,25 @@ input[type=range] { width: 110px; }
 </div>
 <div id="hud" hidden>
 <span class="pill" id="handPill" title="Что видит программа"><span class="dot"></span>🫰 <span id="handTxt">руки не видно</span></span>
+<span class="pill" id="eyePill" hidden title="Взгляд в камеру"><span class="dot"></span>👁 <span id="eyeTxt">загружаю…</span></span>
 <span class="pill" id="fpsPill"><span id="fps">— FPS</span></span>
 <span class="pill" id="rec"><span class="dot"></span>REC <span id="recTime">0:00</span></span>
 </div>
 <div id="toasts"></div>
 <div id="bar" hidden>
+<div class="row" id="modeRow">
+<button class="btn" data-mode="snap" title="Исчезновение по щелчку пальцами">💨 Щелчок</button>
+<button class="btn" data-mode="eyes" title="Глаза всегда смотрят в камеру">👁 Взгляд в камеру</button>
+<button class="btn" data-mode="both" title="Оба эффекта сразу">✨ Всё вместе</button>
+</div>
+<div class="row" id="eyeRow" hidden>
+<div class="slider">
+<label for="eyeStrength">Сила</label>
+<input type="range" id="eyeStrength" min="0" max="100" step="5" value="100">
+<output id="eyeStrengthOut">100</output>
+</div>
+<button class="btn" id="calibBtn" title="Смотри прямо в объектив камеры 1.5 секунды"><span class="ico">🎯</span> Калибровка</button>
+</div>
 <div class="row">
 <button class="btn primary" id="snapBtn" title="Пробел"><span class="ico">🫰</span> Щёлкнуть</button>
 <button class="btn" id="bgBtn" title="Клавиша B"><span class="ico">🖼️</span> Переснять фон</button>

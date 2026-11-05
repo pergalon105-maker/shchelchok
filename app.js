@@ -19,6 +19,8 @@ const NOISE_N = 256;
 const $ = (id) => document.getElementById(id);
 const video = $('video');
 const canvas = $('view');
+const work = document.createElement('canvas');   // кадр для «Взгляда в камеру» (правится до эффекта)
+const wctx = work.getContext('2d', { willReadFrequently: true });
 const ui = {
 start: $('start'), startBtn: $('startBtn'), startNote: $('startNote'),
 hud: $('hud'), bar: $('bar'), toasts: $('toasts'),
@@ -37,7 +39,11 @@ const settings = {
 mirror: store.get('mirror', true),
 sens: store.get('sens', 6),
 fxSound: store.get('fxSound', true),
+appMode: store.get('appMode', 'snap'),      // snap | eyes | both
+eyeStrength: store.get('eyeStrength', 100),
 };
+const snapOn = () => settings.appMode !== 'eyes';
+const eyesOn = () => settings.appMode !== 'snap';
 function toast(text, kind = '', ms = 3200) {
 const el = document.createElement('div');
 el.className = 'toast ' + kind;
@@ -79,6 +85,7 @@ hands: null,
 audioCtx: null, micStream: null, recDest: null, fxBus: null, detector: null,
 handHistory: [],            // {t, hands:[{r, pt:[x,y]}]}
 pinch: null, lastSnapAt: -1e9,
+eyes: null, eyesLoading: false, vision: null,
 origin0: [0.5, 0.4], c0: [0.5, 0.5], shift: [0, 0], emitted: 0, prevTau: -1, prevMask: null,
 frame: 0,
 };
@@ -119,7 +126,7 @@ applySettingsUI();
 requestWakeLock();
 requestAnimationFrame(loop);
 await sleep(400);
-captureBackground();
+applyMode();
 } catch (err) {
 console.error(err);
 ui.startNote.textContent = (err && err.message) || String(err);
@@ -149,6 +156,7 @@ toast('Не удалось загрузить нейросети (нет инт�
 return;
 }
 const { FilesetResolver, ImageSegmenter, HandLandmarker } = vision;
+app.vision = vision;
 let fileset;
 try { fileset = await FilesetResolver.forVisionTasks(`${MP_BASE}/wasm`); } catch (e) {
 console.warn(e); app.segKind = 'fallback';
@@ -408,11 +416,13 @@ ui.handPill.classList.toggle('flash', st === 'snap');
 ui.handTxt.textContent = st === 'snap' ? 'щёлк!' : st === 'pinch' ? 'пальцы сжаты — щёлкай' : st === 'hand' ? 'рука видна' : 'руки не видно';
 }
 function onGesture(origin, now) {
+if (!snapOn()) return;
 app.lastSnapAt = now;
 if (!app.bgReady) { toastOnce('nobg', 'Сначала нужно снять фон.', 'warn'); return; }
 trigger(origin);
 }
 function canTrigger(now) {
+if (!snapOn()) return false;
 if (!app.bgReady || app.capturing) return false;
 if (app.mode === 'dissolving' || app.mode === 'assembling') return false;
 return now - app.lastTriggerAt > COOLDOWN_MS;
@@ -954,14 +964,24 @@ const fresh = hasRVFC ? newFrame : video.currentTime !== lastVT;
 if (fresh) {
 newFrame = false; lastVT = video.currentTime;
 app.frame++;
-segCtx.drawImage(video, 0, 0, app.sw, app.sh);
+let src = video;
+// «Взгляд в камеру»: глаза правятся ДО эффекта, чтобы пыль брала цвет уже исправленных глаз
+if (eyesOn() && app.eyes && app.mode !== 'hidden') {
+if (work.width !== app.vw || work.height !== app.vh) { work.width = app.vw; work.height = app.vh; }
+wctx.drawImage(video, 0, 0);
+app.eyes.process(work, now);
+src = work;
+}
+if (snapOn()) {
+segCtx.drawImage(src, 0, 0, app.sw, app.sh);
 segRGB = segCtx.getImageData(0, 0, app.sw, app.sh).data;
 runSegmentation(now);
 processMask();
 if (app.mode === 'dissolving' || app.mode === 'assembling') updateShift();
 runHands(now);
+}
 gl.bindTexture(gl.TEXTURE_2D, texVideo);
-gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
 gl.bindTexture(gl.TEXTURE_2D, texMask);
 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, app.sw, app.sh, 0, gl.RGBA, gl.UNSIGNED_BYTE, maskU8);
 fpsN++;
@@ -981,7 +1001,8 @@ if (now - fpsT >= 1000) {
 ui.fps.textContent = Math.round(fpsN * 1000 / (now - fpsT)) + ' FPS';
 fpsN = 0; fpsT = now;
 }
-if (app.hands) {
+if (eyesOn() && now - eyeUiT > 250) { eyeUiT = now; updateEyeUI(); }
+if (app.hands && snapOn()) {
 const hv = handVisibleRecently(now);
 setGesture(now - app.lastSnapAt < 600 ? 'snap' : (app.pinch && now - app.pinch.t < 250) ? 'pinch' : hv ? 'hand' : 'none');
 } else if (app.frame === 5) { ui.handTxt.textContent = 'рука: выкл'; }
@@ -1036,8 +1057,55 @@ function applySettingsUI() {
 ui.mirrorBtn.classList.toggle('active', settings.mirror);
 ui.sens.value = settings.sens; ui.sensOut.textContent = settings.sens;
 ui.fxSound.checked = settings.fxSound;
+$('eyeStrength').value = settings.eyeStrength; $('eyeStrengthOut').textContent = settings.eyeStrength;
+document.querySelectorAll('[data-mode]').forEach((b) => b.classList.toggle('active', b.dataset.mode === settings.appMode));
 }
 ui.snapBtn.addEventListener('click', () => manualSnap(null));
+let eyeUiT = 0;
+function updateEyeUI() {
+const pill = $('eyePill'), txt = $('eyeTxt');
+if (!app.eyes) { pill.classList.remove('on'); txt.textContent = app.eyesLoading ? 'загружаю…' : 'выкл'; return; }
+const st = app.eyes.status;
+pill.classList.toggle('on', st.active > 0.5);
+pill.classList.toggle('flash', !!st.calibrating);
+txt.textContent = st.calibrating ? '🎯 смотри прямо в камеру…' : st.face ? `${st.reason} · ${Math.round(st.active * 100)}%` : 'лица не видно';
+}
+async function loadEyes() {
+if (app.eyesLoading || app.eyes) return;
+app.eyesLoading = true; updateEyeUI();
+try {
+const { EyeContact } = await import('./eye-contact.js');
+app.eyes = await EyeContact.create(app.vision ? { vision: app.vision } : {});
+app.eyes.strength = settings.eyeStrength / 100;
+if (!app.eyes.status.calibrated) toast('Совет: нажми «🎯 Калибровка» и 1.5 секунды смотри прямо в камеру — так глаза будут точнее.', '', 7000);
+} catch (err) {
+console.warn(err);
+toast('Не удалось загрузить «Взгляд в камеру» (нет интернета?).', 'err', 6000);
+}
+app.eyesLoading = false; updateEyeUI();
+}
+function applyMode() {
+const s = snapOn(), e = eyesOn();
+document.querySelectorAll('[data-mode]').forEach((b) => b.classList.toggle('active', b.dataset.mode === settings.appMode));
+ui.snapBtn.hidden = !s; ui.bgBtn.hidden = !s; ui.handPill.hidden = !s;
+$('eyeRow').hidden = !e; $('eyePill').hidden = !e;
+if (!s && app.mode !== 'visible') { app.mode = 'visible'; app.emitted = 0; }
+if (e && !app.eyes) loadEyes();
+if (s && app.started && !app.bgReady && !app.capturing) captureBackground();
+}
+document.querySelectorAll('[data-mode]').forEach((b) => b.addEventListener('click', () => {
+settings.appMode = b.dataset.mode; store.set('appMode', settings.appMode);
+if (app.started) applyMode(); else applySettingsUI();
+}));
+$('eyeStrength').addEventListener('input', () => {
+settings.eyeStrength = +$('eyeStrength').value; $('eyeStrengthOut').textContent = settings.eyeStrength; store.set('eyeStrength', settings.eyeStrength);
+if (app.eyes) app.eyes.strength = settings.eyeStrength / 100;
+});
+$('calibBtn').addEventListener('click', () => {
+if (!app.eyes) { toast('Модуль глаз ещё загружается…', 'warn'); return; }
+app.eyes.calibrate();
+toast('🎯 Смотри прямо в камеру (в объектив) 1.5 секунды…', '', 2500);
+});
 $('setBtn').addEventListener('click', () => {
 const r = $('setRow'), h = $('hint'); r.hidden = !r.hidden; h.hidden = r.hidden;
 $('setBtn').classList.toggle('active', !r.hidden);
@@ -1060,6 +1128,7 @@ if (app.fxOut) app.fxOut.gain.value = settings.fxSound ? 1 : 0;
 function toggleMirror() { settings.mirror = !settings.mirror; store.set('mirror', settings.mirror); applySettingsUI(); }
 function manualSnap(origin) {
 if (!app.started) return;
+if (!snapOn()) { toastOnce('nosnap', 'Сейчас режим «Взгляд в камеру» — щелчок выключен.', 'warn'); return; }
 if (!app.bgReady) { toastOnce('nobg', 'Сначала нужно снять фон.', 'warn'); return; }
 if (!canTrigger(performance.now())) return;
 if (!origin) {
