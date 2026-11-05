@@ -1,4 +1,4 @@
-const VERSION = 'v1';
+const VERSION = 'v4';
 const SHELL = `shell-${VERSION}`;
 const MODELS = 'models-v1';
 const SHELL_FILES = ['./', './index.html', './app.js', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
@@ -24,7 +24,7 @@ return res;
 return;
 }
 if (url.origin === self.location.origin) {
-e.respondWith(fetch(req).then((res) => {
+e.respondWith(fetch(req, { cache: 'no-cache' }).then((res) => {
 if (res.ok) { const copy = res.clone(); caches.open(SHELL).then((c) => c.put(req, copy)); }
 return res;
 }).catch(() => caches.match(req).then((r) => r || caches.match('./index.html'))));

@@ -1074,7 +1074,7 @@ async function loadEyes() {
 if (app.eyesLoading || app.eyes) return;
 app.eyesLoading = true; updateEyeUI();
 try {
-const { EyeContact } = await import('./eye-contact.js');
+const { EyeContact } = await import('./eye-contact.js?v=4');
 app.eyes = await EyeContact.create(app.vision ? { vision: app.vision } : {});
 app.eyes.strength = settings.eyeStrength / 100;
 if (!app.eyes.status.calibrated) toast('Совет: нажми «🎯 Калибровка» и 1.5 секунды смотри прямо в камеру — так глаза будут точнее.', '', 7000);
