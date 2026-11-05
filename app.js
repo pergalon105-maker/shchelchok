@@ -8,12 +8,12 @@ hand: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_land
 const params = new URLSearchParams(location.search);
 const TEST_MODE = params.has('test');           // для отладки: без MediaPipe и без микрофона
 const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.userAgent));
-const WAVE_TIME = 1.7;      // за сколько волна проходит всё тело
-const NOISE_DELAY = 0.30;   // насколько рваный край (разброс задержки)
-const LIFE_MIN = 0.9, LIFE_MAX = 1.75;
+const WAVE_TIME = 3.0;      // за сколько волна проходит всё тело
+const NOISE_DELAY = 0.55;   // насколько рваный край (разброс задержки)
+const LIFE_MIN = 2.2, LIFE_MAX = 3.8;
 const EFFECT_T = WAVE_TIME + NOISE_DELAY * 2 + LIFE_MAX + 0.05;
 const COOLDOWN_MS = 1500;
-const ASM_SKIP = 0.9;       // возврат начинается сразу с летящей пыли (без паузы)
+const ASM_SKIP = 2.4;       // возврат начинается сразу с летящей пыли (без паузы)
 const MAXP = IS_MOBILE ? 70000 : 160000;   // максимум частиц
 const NOISE_N = 256;
 const $ = (id) => document.getElementById(id);
@@ -85,7 +85,7 @@ hands: null,
 audioCtx: null, micStream: null, recDest: null, fxBus: null, detector: null,
 handHistory: [],            // {t, hands:[{r, pt:[x,y]}]}
 pinch: null, lastSnapAt: -1e9,
-eyes: null, eyesLoading: false, vision: null,
+eyes: null, eyesLoading: false, vision: null, settleUntil: 0, lastSrc: null,
 origin0: [0.5, 0.4], c0: [0.5, 0.5], shift: [0, 0], emitted: 0, prevTau: -1, prevMask: null,
 frame: 0,
 };
@@ -462,13 +462,15 @@ app.c0 = [st.cx, st.cy];
 app.shift = [0, 0];
 let dir = Math.sign(st.cx - origin[0]);
 if (Math.abs(st.cx - origin[0]) < 0.02) dir = Math.random() < 0.5 ? -1 : 1;
-app.wind = [dir * 0.42, -0.16];
+app.wind = [dir * 0.38, -0.12];
 app.mode = kind;
 app.effectStart = performance.now();
 app.lastTriggerAt = app.effectStart;
-app.emitted = 0; app.prevTau = -1;
-app.prevMask = Float32Array.from(maskS);
-if (kind === 'assembling') emitAssemble();
+// «Фото» в момент щелчка: эта застывшая фигура и рассыпается (или в неё собирается пыль)
+gl.bindTexture(gl.TEXTURE_2D, texSnap);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, app.lastSrc || video);
+gl.bindTexture(gl.TEXTURE_2D, texSnapMask);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, app.sw, app.sh, 0, gl.RGBA, gl.UNSIGNED_BYTE, maskU8);
 playDustSound(kind === 'assembling');
 }
 let noiseBuf = null;
@@ -484,7 +486,7 @@ b = 0.97 * b + 0.03 * wN;
 d[i] = wN * 0.6 + b * 3 + (Math.random() < 0.0015 ? (Math.random() * 2 - 1) * 2.2 : 0); // шорох + треск
 }
 }
-const t = ctx.currentTime + 0.01, dur = reverse ? EFFECT_T - ASM_SKIP - 0.1 : Math.min(3.4, EFFECT_T - 0.2);
+const t = ctx.currentTime + 0.01, dur = reverse ? EFFECT_T - ASM_SKIP - 0.1 : Math.min(6.5, EFFECT_T - 0.2);
 const src = ctx.createBufferSource(); src.buffer = noiseBuf;
 const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 0.8;
 const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 6000;
@@ -579,7 +581,7 @@ app.capturing = false;
 ui.bgBtn.disabled = false;
 }
 }
-let gl, progComp, progBg, progPart, texVideo, texNoise, texMask, pdata, partBuf, noiseU8, bgTex = [], bgFbo = [], bgIdx = 0, bgW = 0, bgH = 0;
+let gl, progComp, progBg, progPart, texVideo, texNoise, texMask, texSnap, texSnapMask, partCount = 0, noiseU8, bgTex = [], bgFbo = [], bgIdx = 0, bgW = 0, bgH = 0;
 let partVao = null, quadVao, maxPointSize = 64;
 const GLSL_NOISE = `
 uniform vec2 uOrigin; uniform float uAspect; uniform float uSpread; uniform vec2 uShift; uniform sampler2D uNoise;
@@ -601,31 +603,41 @@ gl_Position = vec4(aPos, 0.0, 1.0);
 const FS_COMP = `#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 outColor;
-uniform sampler2D uVideo, uBg, uMask;
-uniform int uMode; uniform float uTau, uDil; uniform vec3 uGain; uniform float uHasBg;
+uniform sampler2D uVideo, uBg, uMask, uSnap, uSnapMask;
+uniform int uMode; uniform float uTau, uDil, uFade; uniform vec3 uGain; uniform float uHasBg;
 ${GLSL_NOISE}
 void main(){
 vec2 uv = vUv;
 vec3 v = texture(uVideo, uv).rgb;
 if (uHasBg < 0.5 || uMode == 0) { outColor = vec4(v, 1.0); return; }
+vec3 col = v;
+if (uMode != 4) {
+// живого человека прячем целиком: под ним фон
 vec4 mk = texture(uMask, uv);
 float zone = mk.b;
 vec3 b = texture(uBg, uv).rgb * mix(vec3(1.0), uGain, smoothstep(0.0, 0.3, zone));
-float m = mix(mk.r, mk.g, uDil);
-m = smoothstep(0.12, 0.45, m);
+float m = smoothstep(0.12, 0.45, mk.g);
 float diff = length(v - b);
-float halo = smoothstep(0.02, 0.2, zone) * smoothstep(0.05, 0.14, diff) * uDil;
-float rep = clamp(max(m, halo), 0.0, 1.0);
-float hide = 1.0, x = 1.0;
-if (uMode == 1 || uMode == 3) { float d = delayAt(uv); x = uTau - d; hide = smoothstep(-0.035, 0.035, x); }
-vec3 col = mix(v, b, rep * hide);
-if (uMode == 1 || uMode == 3) {
-float body = smoothstep(0.35, 0.6, mk.r) * (1.0 - hide);
-float pre = smoothstep(-0.32, 0.0, x);
-col = mix(col, col * vec3(0.42, 0.36, 0.32), pre * body * 0.75);
-float edge = exp(-pow((x + 0.03) / 0.045, 2.0)) * body;
-float flick = 0.75 + 0.5 * vnoise(uv * 90.0 + uTau * 7.0);
-col += vec3(1.0, 0.46, 0.14) * edge * 0.95 * flick;
+float halo = smoothstep(0.02, 0.2, zone) * smoothstep(0.05, 0.14, diff);
+col = mix(v, b, clamp(max(m, halo), 0.0, 1.0));
+}
+if (uMode == 1 || uMode == 3 || uMode == 4) {
+// застывшая фигура из кадра щелчка
+float sm = smoothstep(0.35, 0.65, texture(uSnapMask, uv).r);
+vec3 s = texture(uSnap, uv).rgb;
+float keep = 1.0;
+if (uMode != 4) {
+float x = uTau - delayAt(uv);
+keep = 1.0 - smoothstep(-0.02, 0.02, x);
+// перед тем как рассыпаться, тело сереет, как пепел, и покрывается трещинками
+float pre = smoothstep(-0.5, 0.0, x);
+float l = dot(s, vec3(0.299, 0.587, 0.114));
+vec3 ashy = mix(s, vec3(l) * 0.55 + vec3(0.05, 0.045, 0.04), 0.7);
+s = mix(s, ashy, pre * 0.9);
+float cr = smoothstep(0.6, 0.8, vnoise(uv * vec2(uAspect, 1.0) * 160.0)) * smoothstep(-0.25, 0.0, x);
+s *= 1.0 - cr * 0.55;
+} else keep = uFade;
+col = mix(col, s, sm * keep);
 }
 outColor = vec4(col, 1.0);
 }`;
@@ -645,9 +657,10 @@ outColor = vec4(o, 1.0);
 }`;
 const VS_PART = `#version 300 es
 precision highp float;
-in vec2 aPos0; in float aT0; in vec3 aCol; in vec4 aRand;
-uniform float uT, uDir, uMirror, uCell, uMaxPt; uniform vec2 uWind, uShift2;
-out vec4 vCol; out float vSoft;
+in vec2 aHome; in vec4 aRand;
+uniform sampler2D uSnap, uSnapMask;
+uniform float uTau, uMirror, uCell, uMaxPt; uniform vec2 uWind;
+out vec4 vCol; out float vSpin; out float vShape; out float vP;
 ${GLSL_NOISE}
 vec2 curl(vec2 p){
 float e = 0.05;
@@ -657,44 +670,51 @@ float c = vnoise(p + vec2(e, 0.0)) + 0.5*vnoise(2.1*(p + vec2(e, 0.0)));
 float d = vnoise(p - vec2(e, 0.0)) + 0.5*vnoise(2.1*(p - vec2(e, 0.0)));
 return vec2(a - b, -(c - d)) / (2.0 * e);
 }
-void cull(){ gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; vCol = vec4(0.0); vSoft = 0.0; }
+void cull(){ gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; vCol = vec4(0.0); vSpin = 0.0; vShape = 0.0; vP = 0.0; }
 void main(){
+float m = texture(uSnapMask, aHome).r;
+if (m < 0.5) { cull(); return; }
+float d = delayAt(aHome) - 0.015 + aRand.x * 0.1;
 float life = ${LIFE_MIN.toFixed(2)} + aRand.y * ${(LIFE_MAX - LIFE_MIN).toFixed(2)};
-float local = uDir > 0.0 ? uT - aT0 : aT0 - uT;
+float local = uTau - d;
 if (local < 0.0 || local > life) { cull(); return; }
 float p = local / life;
-float gust = p * p * 1.15 + p * 0.22;
+// хлопья сначала медленно отслаиваются, потом их подхватывает ветер
+float e = p * p * (1.7 - 0.7 * p);
 vec2 wind = uWind * (0.55 + aRand.z * 0.9);
-vec2 off = wind * gust;
-off.y -= (0.03 + aRand.w * 0.10) * p * p;
-vec2 cp = aPos0 * vec2(uAspect, 1.0) * 2.5 + vec2(uT * 0.25, aRand.x * 3.0);
-off += curl(cp) * 0.018 * p * (0.6 + aRand.w);
-float ang = aRand.z * 6.2832 + local * (3.0 + aRand.w * 6.0);
-off += vec2(cos(ang), sin(ang)) * (0.004 + 0.01 * aRand.y) * p;
+vec2 off = wind * e;
+off.y -= (0.015 + aRand.w * 0.07) * e;
+vec2 cp = aHome * vec2(uAspect, 1.0) * 3.0 + vec2(uTau * 0.12, aRand.x * 4.0);
+off += curl(cp) * 0.011 * e * (0.5 + aRand.w);
+float spin = aRand.z * 6.2832 + local * (1.5 + aRand.w * 4.0) * (aRand.x > 0.5 ? 1.0 : -1.0);
+off += vec2(cos(spin), sin(spin)) * 0.0025 * e;
 off.x /= uAspect;
-vec2 pos = aPos0 + uShift2 + off;
+vec2 pos = aHome + off;
 float x = uMirror > 0.5 ? 1.0 - pos.x : pos.x;
 gl_Position = vec4(x * 2.0 - 1.0, 1.0 - pos.y * 2.0, 0.0, 1.0);
-vec3 c = aCol;
+vec3 c = texture(uSnap, aHome).rgb;
 float lum = dot(c, vec3(0.299, 0.587, 0.114));
-vec3 ash = vec3(0.07, 0.065, 0.06) + vec3(0.55, 0.52, 0.5) * lum * 0.45;
-vec3 col = mix(c, ash, smoothstep(0.04, 0.5, p));
-float ember = step(0.72, aRand.w) * exp(-local * 9.0);
-col += vec3(1.0, 0.45, 0.12) * ember * 0.9;
-float alpha = (1.0 - smoothstep(0.55, 1.0, p)) * 0.95;
-float size = uCell * (1.0 + aRand.z * 0.8) * (1.0 - 0.6 * p);
+vec3 ash = mix(vec3(0.13, 0.115, 0.10), c * 0.45, 0.35) + lum * 0.08;
+vec3 col = mix(c, ash, smoothstep(0.0, 0.35, p));
+col *= 0.72 + 0.4 * abs(cos(spin * 1.3));   // хлопья поблёскивают, когда кувыркаются
+float alpha = 1.0 - smoothstep(0.6, 1.0, p);
+float size = uCell * (1.2 + aRand.z * 0.8) * (1.0 - 0.45 * p);
 gl_PointSize = clamp(size, 1.0, uMaxPt);
-vSoft = clamp(size, 1.0, 8.0);
+vSpin = spin * step(0.02, p); vShape = aRand.w; vP = p;
 vCol = vec4(col * alpha, alpha);
 }`;
 const FS_PART = `#version 300 es
 precision highp float;
-in vec4 vCol; in float vSoft; out vec4 outColor;
+in vec4 vCol; in float vSpin; in float vShape; in float vP; out vec4 outColor;
 void main(){
-float r = length(gl_PointCoord - 0.5) * 2.0;
-float a = 1.0 - smoothstep(1.0 - 1.6 / vSoft, 1.0, r);
-if (a <= 0.0) discard;
-outColor = vCol * a;
+vec2 q = gl_PointCoord - 0.5;
+float cs = cos(vSpin), sn = sin(vSpin);
+q = vec2(cs * q.x - sn * q.y, sn * q.x + cs * q.y);
+q.y *= 1.0 + 1.5 * vShape * smoothstep(0.0, 0.3, vP) * abs(sin(vSpin * 0.7));
+float sq = max(abs(q.x), abs(q.y));
+float di = (abs(q.x) + abs(q.y)) * 0.72;
+if (mix(sq, di, step(0.5, vShape)) > 0.5) discard;
+outColor = vCol;
 }`;
 function compile(type, src) {
 const s = gl.createShader(type);
@@ -734,7 +754,7 @@ if (!gl) throw new Error('Этот браузер не поддерживает 
 canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); toast('Видеокарта перезапустилась — обнови страницу.', 'err', 10000); });
 progComp = program(VS_QUAD, FS_COMP, ['aPos']);
 progBg = program(VS_QUAD, FS_BG, ['aPos']);
-progPart = program(VS_PART, FS_PART, ['aPos0', 'aT0', 'aCol', 'aRand']);
+progPart = program(VS_PART, FS_PART, ['aHome', 'aRand']);
 maxPointSize = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1] || 64;
 quadVao = gl.createVertexArray();
 gl.bindVertexArray(quadVao);
@@ -742,7 +762,7 @@ const qb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qb);
 gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
 gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 gl.bindVertexArray(null);
-texVideo = makeTex(); texMask = makeTex(); texNoise = makeTex();
+texVideo = makeTex(); texMask = makeTex(); texNoise = makeTex(); texSnap = makeTex(); texSnapMask = makeTex();
 gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
 gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
 resize();
@@ -766,19 +786,26 @@ canvas.style.height = Math.floor(app.vh * s) + 'px';
 }
 window.addEventListener('resize', () => { if (app.vw) fitCanvas(); });
 function buildParticles() {
-app.cellPx = (app.vw / app.sw) * (IS_MOBILE ? 1.15 : 0.95);
-pdata = new Float32Array(MAXP * 10);
-if (!partVao) {
+const aspect = app.vw / app.vh;
+const target = IS_MOBILE ? 90000 : 230000;   // частиц на весь кадр (рисуются только те, что на теле)
+const pw = Math.round(Math.sqrt(target * aspect)), ph = Math.round(pw / aspect);
+partCount = pw * ph;
+const home = new Float32Array(partCount * 2), rnd = new Float32Array(partCount * 4);
+let i = 0;
+for (let y = 0; y < ph; y++) for (let x = 0; x < pw; x++, i++) {
+home[i * 2] = (x + 0.2 + Math.random() * 0.6) / pw;
+home[i * 2 + 1] = (y + 0.2 + Math.random() * 0.6) / ph;
+rnd[i * 4] = Math.random(); rnd[i * 4 + 1] = Math.random(); rnd[i * 4 + 2] = Math.random(); rnd[i * 4 + 3] = Math.random();
+}
+app.cellPx = app.vw / pw;
+if (partVao) gl.deleteVertexArray(partVao);
 partVao = gl.createVertexArray();
 gl.bindVertexArray(partVao);
-partBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, partBuf);
-gl.bufferData(gl.ARRAY_BUFFER, MAXP * 40, gl.DYNAMIC_DRAW);
-gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 40, 0);
-gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 40, 8);
-gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 40, 12);
-gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 40, 24);
+const b1 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b1); gl.bufferData(gl.ARRAY_BUFFER, home, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const b2 = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b2); gl.bufferData(gl.ARRAY_BUFFER, rnd, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0);
 gl.bindVertexArray(null);
-}
 // шумовая карта для рваного края волны (одна и та же на CPU и в шейдере)
 const N = NOISE_N, asp = app.vw / app.vh;
 const hash = (x, y) => { const h = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return h - Math.floor(h); };
@@ -812,63 +839,6 @@ const asp = app.vw / app.vh;
 const ox = app.origin0[0] + app.shift[0], oy = app.origin0[1] + app.shift[1];
 const n = sampleNoise(u - app.shift[0], v - app.shift[1]) - 0.47;
 return Math.hypot((u - ox) * asp, v - oy) * app.spread + n * NOISE_DELAY * 2 + NOISE_DELAY;
-}
-let flushFrom = 0;
-function pushParticle(u, v, t0, i4) {
-if (app.emitted >= MAXP) return;
-const o = app.emitted * 10;
-pdata[o] = u; pdata[o + 1] = v; pdata[o + 2] = t0;
-const j = (Math.random() - 0.5) * 12;
-pdata[o + 3] = clamp((segRGB[i4] + j) / 255, 0, 1); pdata[o + 4] = clamp((segRGB[i4 + 1] + j) / 255, 0, 1); pdata[o + 5] = clamp((segRGB[i4 + 2] + j) / 255, 0, 1);
-pdata[o + 6] = Math.random(); pdata[o + 7] = Math.random(); pdata[o + 8] = Math.random(); pdata[o + 9] = Math.random();
-app.emitted++;
-}
-function flushParticles() {
-if (app.emitted <= flushFrom) return;
-gl.bindBuffer(gl.ARRAY_BUFFER, partBuf);
-gl.bufferSubData(gl.ARRAY_BUFFER, flushFrom * 40, pdata, flushFrom * 10, (app.emitted - flushFrom) * 10);
-flushFrom = app.emitted;
-}
-const PER_PX = IS_MOBILE ? 1 : 2;
-// Исчезновение: частицы рождаются там, где тело СЕЙЧАС, в момент, когда его касается волна
-function emitDissolve(tau) {
-if (!segRGB) return;
-const prev = app.prevTau; app.prevTau = tau;
-const w = app.sw, h = app.sh, pm = app.prevMask;
-if (app.emitted === 0) flushFrom = 0;
-for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-const i = y * w + x;
-if (maskS[i] < 0.5) continue;
-const u = (x + 0.5) / w, v = (y + 0.5) / h;
-const d = delayCPU(u, v) - 0.02;
-let t0 = -1;
-if (d > prev && d <= tau) t0 = d;
-if (t0 < 0) continue;
-for (let k = 0; k < PER_PX; k++) pushParticle(u + (Math.random() - 0.5) / w, v + (Math.random() - 0.5) / h, t0, i * 4);
-}
-if (pm) pm.set(maskS);
-flushParticles();
-}
-// Возврат: пыль летит к телу, точки прилёта двигаются вместе с телом
-function emitAssemble() {
-if (!segRGB) return;
-flushFrom = 0;
-const TA = EFFECT_T - ASM_SKIP, w = app.sw, h = app.sh;
-for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-const i = y * w + x;
-if (maskS[i] < 0.5) continue;
-const u = (x + 0.5) / w, v = (y + 0.5) / h;
-const t0 = TA - delayCPU(u, v);
-for (let k = 0; k < PER_PX; k++) pushParticle(u + (Math.random() - 0.5) / w, v + (Math.random() - 0.5) / h, t0, i * 4);
-}
-flushParticles();
-}
-function updateShift() {
-const st = bodyStats();
-if (!st || st.area < 0.003) return;
-const tx = st.cx - app.c0[0], ty = st.cy - app.c0[1];
-app.shift[0] += (tx - app.shift[0]) * 0.5;
-app.shift[1] += (ty - app.shift[1]) * 0.5;
 }
 function gl_uploadBackground(rgba, w, h) {
 bgW = w; bgH = h;
@@ -920,7 +890,9 @@ gl.useProgram(progComp.p);
 const u = progComp.u;
 gl.uniform1f(u.uMirror, settings.mirror ? 1 : 0);
 gl.uniform1f(u.uFbo, 0);
-gl.uniform1i(u.uMode, MODE_ID[app.mode]);
+const settle = app.mode === 'visible' && performance.now() < app.settleUntil;
+gl.uniform1i(u.uMode, settle ? 4 : MODE_ID[app.mode]);
+gl.uniform1f(u.uFade, settle ? clamp((app.settleUntil - performance.now()) / 600, 0, 1) : 1);
 gl.uniform1f(u.uTau, tau);
 gl.uniform1f(u.uDil, dil);
 gl.uniform3f(u.uGain, gain[0], gain[1], gain[2]);
@@ -929,6 +901,8 @@ setNoiseUniforms(u);
 bindTex(0, texVideo, u.uVideo);
 bindTex(1, bgTex.length ? bgTex[bgIdx] : texVideo, u.uBg);
 bindTex(2, texMask, u.uMask);
+bindTex(3, texSnap, u.uSnap);
+bindTex(4, texSnapMask, u.uSnapMask);
 gl.bindVertexArray(quadVao);
 gl.drawArrays(gl.TRIANGLES, 0, 3);
 if (app.mode === 'dissolving' || app.mode === 'assembling') {
@@ -937,15 +911,15 @@ gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 gl.useProgram(progPart.p);
 const p = progPart.u;
 setNoiseUniforms(p);
-gl.uniform1f(p.uT, el);
-gl.uniform1f(p.uDir, app.mode === 'dissolving' ? 1 : -1);
-if (app.mode === 'assembling') gl.uniform2f(p.uShift2, app.shift[0], app.shift[1]); else gl.uniform2f(p.uShift2, 0, 0);
+gl.uniform1f(p.uTau, tau);
+bindTex(0, texSnap, p.uSnap);
+bindTex(1, texSnapMask, p.uSnapMask);
 gl.uniform1f(p.uMirror, settings.mirror ? 1 : 0);
 gl.uniform1f(p.uCell, app.cellPx);
 gl.uniform1f(p.uMaxPt, maxPointSize);
 gl.uniform2f(p.uWind, app.wind[0], app.wind[1]);
 gl.bindVertexArray(partVao);
-if (app.emitted) gl.drawArrays(gl.POINTS, 0, app.emitted);
+gl.drawArrays(gl.POINTS, 0, partCount);
 gl.disable(gl.BLEND);
 }
 gl.bindVertexArray(null);
@@ -977,11 +951,11 @@ segCtx.drawImage(src, 0, 0, app.sw, app.sh);
 segRGB = segCtx.getImageData(0, 0, app.sw, app.sh).data;
 runSegmentation(now);
 processMask();
-if (app.mode === 'dissolving' || app.mode === 'assembling') updateShift();
 runHands(now);
 }
 gl.bindTexture(gl.TEXTURE_2D, texVideo);
 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+app.lastSrc = src;
 gl.bindTexture(gl.TEXTURE_2D, texMask);
 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, app.sw, app.sh, 0, gl.RGBA, gl.UNSIGNED_BYTE, maskU8);
 fpsN++;
@@ -990,11 +964,10 @@ const el = (now - app.effectStart) / 1000;
 let tau = 0, dil = 0;
 if (app.mode === 'dissolving') {
 tau = el; dil = smooth01(0, 1.6, tau);
-emitDissolve(tau);
 if (el >= EFFECT_T) { app.mode = 'hidden'; app.lastTriggerAt = Math.max(app.lastTriggerAt, now - COOLDOWN_MS + 400); }
 } else if (app.mode === 'assembling') {
 tau = EFFECT_T - ASM_SKIP - el; dil = smooth01(0, 1.6, tau);
-if (tau <= 0) { app.mode = 'visible'; app.lastTriggerAt = Math.max(app.lastTriggerAt, now - COOLDOWN_MS + 400); }
+if (tau <= 0) { app.mode = 'visible'; app.settleUntil = now + 600; app.lastTriggerAt = Math.max(app.lastTriggerAt, now - COOLDOWN_MS + 400); }
 } else if (app.mode === 'hidden') { tau = EFFECT_T; dil = 1; }
 render(tau, dil, el);
 if (now - fpsT >= 1000) {
